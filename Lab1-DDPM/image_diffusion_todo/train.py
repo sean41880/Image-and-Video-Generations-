@@ -131,7 +131,7 @@ def main(args):
     with tqdm(initial=step, total=config.train_num_steps) as pbar:
         while step < config.train_num_steps:
             from PIL import Image
-            if step % config.log_interval == 0:
+            if step % 2000 == 0:
                 ddpm.eval()
                 
                 plt.plot(losses)
@@ -180,7 +180,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--train_num_steps",
         type=int,
-        default=100000, #50000, #100000
+        default=50000, #50000, #100000
         help="the number of model training steps.",
     )
     parser.add_argument("--warmup_steps", type=int, default=200)
