@@ -137,8 +137,8 @@ class DDPMScheduler(BaseScheduler):
         # 3. Compute the posterior variance \tilde{β}_t = ((1-ᾱ_{t-1})/(1-ᾱ_t)) * β_t.
         posterior_var = ((1 - alpha_bar_t_prev) / (1 - alpha_bar_t)) * beta_t
         # 4. Add Gaussian noise scaled by √(\tilde{β}_t) unless t == 0.
-        noise = torch.randn_like(x_t) if (t > 0).any() else torch.zeros_like(x_t)
-        mask = (t != 0).float().reshape(-1, *([1] * (x_t.dim() - 1)))
+        noise = torch.randn_like(x_t, device=x_t.device) if (t > 0).any() else torch.zeros_like(x_t, device=x_t.device)
+        mask = (t != 0).float().reshape(-1, *([1] * (x_t.dim() - 1))).to(x_t.device)
         sample_prev = mean + mask * torch.sqrt(posterior_var) * noise
         # 5. Return the final sample at t-1.
         #######################
@@ -168,8 +168,8 @@ class DDPMScheduler(BaseScheduler):
             torch.sqrt(alpha_bar_t_prev) * beta_t * x0_pred + torch.sqrt(alpha_t) * (1 - alpha_bar_t_prev) * x_t
         ) / (1 - alpha_bar_t)
         posterior_var = ((1 - alpha_bar_t_prev) / (1 - alpha_bar_t)) * beta_t
-        noise = torch.randn_like(x_t) if (t > 0).any() else torch.zeros_like(x_t)
-        mask = (t != 0).float().reshape(-1, *([1] * (x_t.dim() - 1)))
+        noise = torch.randn_like(x_t, device=x_t.device) if (t > 0).any() else torch.zeros_like(x_t, device=x_t.device)
+        mask = (t != 0).float().reshape(-1, *([1] * (x_t.dim() - 1))).to(x_t.device)
         sample_prev = mean + mask * torch.sqrt(posterior_var) * noise
         #######################
         return sample_prev
@@ -194,8 +194,8 @@ class DDPMScheduler(BaseScheduler):
         alpha_bar_t = extract(self.alphas_cumprod, t, x_t)
         alpha_bar_t_prev = extract(torch.cat([self.alphas_cumprod.new_ones(1), self.alphas_cumprod[:-1]], 0), t, x_t)
         posterior_var = ((1 - alpha_bar_t_prev) / (1 - alpha_bar_t)) * beta_t
-        noise = torch.randn_like(x_t) if (t > 0).any() else torch.zeros_like(x_t)
-        mask = (t != 0).float().reshape(-1, *([1] * (x_t.dim() - 1)))
+        noise = torch.randn_like(x_t, device=x_t.device) if (t > 0).any() else torch.zeros_like(x_t, device=x_t.device)
+        mask = (t != 0).float().reshape(-1, *([1] * (x_t.dim() - 1))).to(x_t.device)
         sample_prev = mean_theta + mask * torch.sqrt(posterior_var) * noise
         #######################
         return sample_prev
