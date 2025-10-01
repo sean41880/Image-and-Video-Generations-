@@ -1,0 +1,15 @@
+# Ignore dataset and results
+image_diffusion_todo/data/
+image_diffusion_todo/results/
+__pycache__/
+*.py[cod]
+*.ipynb_checkpoints
+data/
+results/
+outputs
+samples/
+.DS_Store
+
+# Solutions
+2d_plot_diffusion
+image_diffusion
