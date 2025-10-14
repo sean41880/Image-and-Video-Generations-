@@ -1,6 +1,7 @@
 # Ignore dataset and results
 image_diffusion_todo/data/
 image_diffusion_todo/results/
+Lab2-DDIM-LoRA/task1/image_diffusion_todo/checkpoint/
 __pycache__/
 *.py[cod]
 *.ipynb_checkpoints

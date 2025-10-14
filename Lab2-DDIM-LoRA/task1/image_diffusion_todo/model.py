@@ -26,10 +26,17 @@ class DiffusionModule(nn.Module):
         ######## TODO ########
         # Here we implement the "predict x0" version.
         # 1. Sample a timestep and add noise to get (x_t, noise).
+        B = x0.shape[0]
+        t = self.var_scheduler.uniform_sample_t(B, x0.device)  # (B,)
+        x_t, eps = self.var_scheduler.add_noise(x0, t, eps=noise)
         # 2. Pass (x_t, timestep) into self.network, where the output should represent the clean sample x0_pred.
+        if class_label is not None:
+            x0_pred = self.network(x_t, t, class_label)
+        else:
+            x0_pred = self.network(x_t, t)  
         # 3. Compute the loss as MSE(predicted x0_pred, ground-truth x0).
+        loss = F.mse_loss(x0_pred, x0)
         ######################
-        loss = None
         return loss
     
     def get_loss_mean(self, x0, class_label=None, noise=None):
@@ -39,8 +46,27 @@ class DiffusionModule(nn.Module):
         # 2. Pass (x_t, timestep) into self.network, where the output should represent the posterior mean μθ(x_t, t).
         # 3. Compute the *true* posterior mean from the closed-form DDPM formula (using x0, x_t, noise, and scheduler terms).
         # 4. Compute the loss as MSE(predicted mean, true mean).
+        B = x0.shape[0]
+        t = self.var_scheduler.uniform_sample_t(B, x0.device)  # (B,)
+        x_t, eps = self.var_scheduler.add_noise(x0, t, eps=noise)
+        if class_label is not None:
+            mean_pred = self.network(x_t, t, class_label)
+        else:
+            mean_pred = self.network(x_t, t)
+        # Closed-form posterior mean (DDPM公式)
+        betas = extract(self.var_scheduler.betas, t, x_t)
+        alphas = extract(self.var_scheduler.alphas, t, x_t)
+        alphas_cumprod = extract(self.var_scheduler.alphas_cumprod, t, x_t)
+        alphas_cumprod_prev = extract(
+            torch.cat([self.var_scheduler.alphas_cumprod.new_ones(1), self.var_scheduler.alphas_cumprod[:-1]], 0),
+            t, x_t
+        )
+        # μ_true = 1/√α_t * (x_t - (β_t/√(1-ᾱ_t)) * eps)
+        mean_true = (
+            1 / torch.sqrt(alphas)
+        ) * (x_t - (betas / torch.sqrt(1 - alphas_cumprod)) * eps)
+        loss = F.mse_loss(mean_pred, mean_true)
         ######################
-        loss = None
         return loss
     
     def get_loss(self, x0, class_label=None, noise=None):
@@ -78,22 +104,28 @@ class DiffusionModule(nn.Module):
 
         if do_classifier_free_guidance:
 
-            ######## CFG ########
-            # Implement the classifier-free guidance.
+            ######## TODO ########
+            # Assignment 2. Implement the classifier-free guidance.
             # Specifically, given a tensor of shape (batch_size,) containing class labels,
             # create a tensor of shape (2*batch_size,) where the first half is filled with zeros (i.e., null condition).
             assert class_label is not None
             assert len(class_label) == batch_size, f"len(class_label) != batch_size. {len(class_label)} != {batch_size}"
-            raise NotImplementedError("No need to implement cfg in assignment 2")
+            null_label = torch.zeros_like(class_label)
+            class_label_guided = torch.cat([null_label, class_label], dim=0)
             #######################
 
         traj = [x_T]
         for t in tqdm(self.var_scheduler.timesteps):
             x_t = traj[-1]
             if do_classifier_free_guidance:
-                ######## CFG ########
-                # Implement the classifier-free guidance.
-                raise NotImplementedError("No need to implement cfg in assignment 2")
+                ######## TODO ########
+                # Assignment 2. Implement the classifier-free guidance.
+                x_t_cat = torch.cat([x_t, x_t], dim=0)
+                net_out = self.network(x_t_cat, timestep=t.to(self.device), class_label=class_label_guided)
+                batch_size = x_t.shape[0]
+                uncond_out = net_out[:batch_size]
+                cond_out = net_out[batch_size:]
+                net_out = uncond_out + guidance_scale * (cond_out - uncond_out)
                 #######################
             else:
                 # 如果是 conditional 就傳 class_label，否則就兩個參數
@@ -133,3 +165,11 @@ class DiffusionModule(nn.Module):
         self.var_scheduler = hparams["var_scheduler"]
 
         self.load_state_dict(state_dict)
+
+
+'''
+python sampling.py --ckpt_path ./checkpoint/last.ckpt --save_dir ./result \
+--sample_method ddim \
+--ddim_steps 100 \
+--eta 0.5
+'''
