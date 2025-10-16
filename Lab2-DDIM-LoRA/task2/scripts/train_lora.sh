@@ -1,6 +1,10 @@
 export MODEL_NAME="CompVis/stable-diffusion-v1-4"
 export DATASET_NAME="lambdalabs/naruto-blip-captions"
-export OUTPUT_DIR="./runs/sd-naruto-model-lora"
+export OUTPUT_DIR="/work_b/Sean/runs/sd-naruto-model-lora"
+export HF_HOME="/work_b/Sean/hf_cache"
+export TRANSFORMERS_CACHE="/work_b/Sean/hf_cache"
+export HF_DATASETS_CACHE="/work_b/Sean/dataset"
+export TMPDIR="/work_b/Sean/tmp"
 
 accelerate launch --mixed_precision="no" train_lora.py \
   --pretrained_model_name_or_path=$MODEL_NAME \

@@ -86,3 +86,14 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     main(args)
+
+'''
+python sampling.py --ckpt_path ~/work_HDD/Sean/checkpoints/last.ckpt --save_dir ./outputs \
+--sample_method ddim \
+--ddim_steps 100 \
+--eta 0.5
+'''
+
+'''
+python fid/measure_fid.py ./data/afhq/eval ./outputs
+'''
