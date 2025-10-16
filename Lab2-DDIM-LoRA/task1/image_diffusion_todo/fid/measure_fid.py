@@ -90,6 +90,6 @@ if __name__ == "__main__":
     # python measure_fid /path/to/dir1 /path/to/dir2
 
     paths = [sys.argv[1], sys.argv[2]]
-    fid_value = calculate_fid_given_paths(paths, img_size=256, batch_size=64)
+    fid_value = calculate_fid_given_paths(paths, img_size=64, batch_size=64)
     print("FID:", fid_value)
 
