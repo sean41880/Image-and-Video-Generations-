@@ -1,0 +1,8 @@
+**/results/
+**/data/
+**/__pycache__/
+**/.ipynb_checkpoints/
+CLAUDE.md
+TASK*.md
+ASSIGNMENT*.md
+*.ckpt

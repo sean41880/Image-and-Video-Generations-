@@ -26,7 +26,11 @@ class StableDiffusion(nn.Module):
         self.tokenizer = pipe.tokenizer
         self.text_encoder = pipe.text_encoder
         self.unet = pipe.unet.eval()
-        
+        #-------------------------------
+        self.unet.enable_gradient_checkpointing()
+        self.unet.to(self.dtype)
+        #-------------------------------
+
         # Freeze models
         for p in self.vae.parameters():
             p.requires_grad_(False)
@@ -58,20 +62,30 @@ class StableDiffusion(nn.Module):
             self._init_vsd_components(args.lora_rank)
     
     def _init_vsd_components(self, lora_rank=4):
-        """Initialize LoRA for VSD"""
         print(f"[INFO] Initializing VSD with LoRA rank={lora_rank}")
-        
+
+        # --- Teacher UNet: No LoRA, Frozen --------------------------------------
+        import copy
+        self.unet_teacher = copy.deepcopy(self.unet).eval().requires_grad_(False)
+        self.unet_teacher = self.unet_teacher.to(self.dtype)
+
+        # --- Student UNet: Add LoRA and Trainable --------------------------------
         self.unet.requires_grad_(False)
-        
+
         unet_lora_config = LoraConfig(
             r=lora_rank,
             lora_alpha=lora_rank,
             init_lora_weights="gaussian",
             target_modules=["to_k", "to_q", "to_v", "to_out.0"],
         )
-        
+
         self.unet.add_adapter(unet_lora_config)
         self.lora_layers = list(filter(lambda p: p.requires_grad, self.unet.parameters()))
+
+        # Memory Optimization Option:
+        self.unet.enable_gradient_checkpointing()
+
+
 
     @torch.no_grad()
     def get_text_embeds(self, prompt):
@@ -110,38 +124,33 @@ class StableDiffusion(nn.Module):
         """
         # TODO: Implement SDS loss
         # --------------------------------------------------------------------
-        device = self.device
+        # latents: (B, C, H, W) assumed in same scale used by UNet (usually in latent space)
+        device = latents.device
+        dtype = latents.dtype
         B = latents.shape[0]
-        assert text_embeddings.shape[0] == 2 * B, "[SDS] text_embeddings 需為 [2B, ...]（前B無條件、後B有條件）。"
 
-        # sample t in [min_step, max_step]
-        t = torch.randint(self.min_step, self.max_step + 1, (B,), device=device).long()
+        # 1. Random timestep t per batch element
+        t_int = torch.randint(self.min_step, self.max_step + 1, (B,), device=device)
+        alphas_t = self.alphas[t_int].to(device=device, dtype=dtype)
+        sqrt_alpha = torch.sqrt(alphas_t).view(B, 1, 1, 1)
+        sqrt_one_minus_alpha = torch.sqrt(1.0 - alphas_t).view(B, 1, 1, 1)
 
-        # add noise: x_t = sqrt(a_bar)*x0 + sqrt(1-a_bar)*eps
+        # 2. Add Gaussian noise to latents
         noise = torch.randn_like(latents)
-        latents_noisy = self.scheduler.add_noise(latents, noise, t)
+        latents_noisy = sqrt_alpha * latents + sqrt_one_minus_alpha * noise
 
-        # predict noise with CFG
-        noise_pred = self.get_noise_preds(latents_noisy, t, text_embeddings, guidance_scale)
+        # 3. Diffusion model predicts noise under classifier-free guidance
+        noise_pred = self.get_noise_preds(latents_noisy, t_int, text_embeddings, guidance_scale=guidance_scale)
 
-        # convert to eps-pred if scheduler is v-prediction
-        pred_type = getattr(self.scheduler.config, "prediction_type", "epsilon")
-        a_bar = self.alphas[t].view(-1, 1, 1, 1)
-        if pred_type == "epsilon":
-            eps_pred = noise_pred
-        elif pred_type == "v_prediction":
-            # eps = sqrt(a_bar)*v + sqrt(1-a_bar)*x_t
-            eps_pred = a_bar.sqrt() * noise_pred + (1.0 - a_bar).sqrt() * latents_noisy
-        else:
-            eps_pred = noise_pred  # safe default
+        # 4. Compute the SDS gradient target
+        grad = (noise_pred - noise).detach()  # no grad into diffusion model
 
-        # weight w(t) = (1 - a_bar)  (stable practical choice)
-        w = (1.0 - a_bar)
-
-        loss = ((w * (eps_pred - noise)) ** 2).mean()
-        return loss
+        # 5. Pseudo-loss whose gradient = SDS gradient
+        #    d(loss)/d(latents) = grad
+        loss = (latents * grad).sum() / B
         # --------------------------------------------------------------------
 
+        return loss
 
     
     def get_vsd_loss(self, latents, text_embeddings, guidance_scale=7.5, lora_loss_weight=1.0):
@@ -152,8 +161,6 @@ class StableDiffusion(nn.Module):
         """
         # TODO: Implement VSD loss
         # --------------------------------------------------------------------
-        # 實務上常用的 VSD 近似：以 SDS 主體 + LoRA 權重 L2 正則，讓可訓練的 LoRA 擬合當前物體分佈，
-        # 同時維持穩定（避免 collapse）。
         device = self.device
         B = latents.shape[0]
         assert text_embeddings.shape[0] == 2 * B, "[VSD] text_embeddings 需為 [2B, ...]。"
@@ -165,24 +172,57 @@ class StableDiffusion(nn.Module):
         noise = torch.randn_like(latents)
         latents_noisy = self.scheduler.add_noise(latents, noise, t)
 
-        # predict noise with CFG (LoRA 參數是可訓練的)
+        # student prediction (LoRA-enabled)
         noise_pred = self.get_noise_preds(latents_noisy, t, text_embeddings, guidance_scale)
 
-        # pred type
+        # scheduler prediction type
         pred_type = getattr(self.scheduler.config, "prediction_type", "epsilon")
         a_bar = self.alphas[t].view(-1, 1, 1, 1)
+        sqrt_ab = a_bar.sqrt()
+        sqrt_omab = (1.0 - a_bar).sqrt()
+
+        # convert v → ε if needed
         if pred_type == "epsilon":
-            eps_pred = noise_pred
+            eps_student = noise_pred
         elif pred_type == "v_prediction":
-            eps_pred = a_bar.sqrt() * noise_pred + (1.0 - a_bar).sqrt() * latents_noisy
+            eps_student = sqrt_ab * noise_pred + sqrt_omab * latents_noisy
         else:
-            eps_pred = noise_pred
+            eps_student = noise_pred
 
-        # main loss (與 SDS 相同的主體)
+        # ----------------- **VSD 核心: 老師模型 (不學習) 預測** -----------------
+        with torch.no_grad():
+            # Teacher forward must match student CFG input format
+            latents_noisy_teacher = latents_noisy.half()
+            t_teacher = t
+            text_emb_teacher = text_embeddings.half()
+
+            # 1) duplicate input, same as student CFG
+            latent_in = torch.cat([latents_noisy_teacher] * 2)
+            tt = torch.cat([t_teacher] * 2)
+
+            # 2) teacher UNet forward
+            noise_pred_teacher = self.unet_teacher(latent_in, tt, encoder_hidden_states=text_emb_teacher).sample
+
+            # 3) split (uncond, cond)
+            noise_pred_teacher_uncond, noise_pred_teacher_pos = noise_pred_teacher.chunk(2)
+
+            # 4) same CFG formula
+            noise_teacher = noise_pred_teacher_uncond + guidance_scale * (noise_pred_teacher_pos - noise_pred_teacher_uncond)
+
+            # 5) convert v → ε if needed
+            if pred_type == "epsilon":
+                eps_teacher = noise_teacher
+            elif pred_type == "v_prediction":
+                eps_teacher = sqrt_ab * noise_teacher + sqrt_omab * latents_noisy
+            else:
+                eps_teacher = noise_teacher
+
+
+        # ----------------- **VSD 主 Loss: 比較 student vs. teacher** -----------------
         w = (1.0 - a_bar)
-        main_loss = ((w * (eps_pred - noise)) ** 2).mean()
+        main_loss = ((w * (eps_student - eps_teacher)) ** 2).mean()
 
-        # LoRA regularization（避免過擬合與崩潰）
+        # ----------------- **LoRA L2 regularization (保留原寫法)** -----------------
         l2 = 0.0
         if hasattr(self, "lora_layers") and self.lora_layers:
             for p in self.lora_layers:
@@ -193,8 +233,8 @@ class StableDiffusion(nn.Module):
         loss = main_loss + l2
         return loss
         # --------------------------------------------------------------------
-    
-    @torch.no_grad()
+
+
     def invert_noise(self, latents, target_t, text_embeddings, guidance_scale=-7.5, n_steps=10, eta=0.3):
         """
         DDIM Inversion: x0 -> x_t
@@ -214,66 +254,54 @@ class StableDiffusion(nn.Module):
         """
         # TODO: (Implement DDIM inversion by yourself — do NOT call built-in inversion helpers):
         # --------------------------------------------------------------------
-        # Write your own DDIM inversion loop that maps x0 -> x_t at `target_t`.
-        # You may *read* external implementations for reference, but you must
-        # NOT call any "invert"/"ddim_invert"/"invert_step" utilities
-        # from diffusers or other libraries.
-        # --------------------------------------------------------------------
         device = self.device
         x = latents.clone()
 
-        # 支援 int 或 tensor 的 target_t
+        # Support int or tensor for target_t
         if isinstance(target_t, int):
             t_target = torch.full((latents.shape[0],), target_t, device=device, dtype=torch.long)
         else:
             t_target = target_t.to(device).long()
 
-        # 產生從 0 → target_t 的 time grid（均勻切分）
-        # 注意：DDIM 的 step 級數是按 index 走，我們用 alpha_bar 直接算
-        t0 = torch.zeros_like(t_target)
-        # 將 grid 生為標量，再在每步複用 batch 的相同 t
+        # Build a simple linear grid from 0 -> max(t_target) with n_steps
         t_vals = torch.linspace(0, float(t_target.max().item()), steps=n_steps + 1, device=device)
-        # 去掉第一個 0（從 x0 開始）
-        t_vals = t_vals[1:]
-        # 逐步推到更大的 t（更有噪聲）
+        t_vals = t_vals[1:]  # skip 0 since x is x0 already
+
         for ti in t_vals:
-            # 取對應整數 timestep
             ti_int = torch.clamp(ti.round().long(), min=0, max=self.num_train_timesteps - 1)
             t = torch.full((latents.shape[0],), ti_int.item(), device=device, dtype=torch.long)
 
             a_bar = self.alphas[t].view(-1, 1, 1, 1)                  # alpha_bar_t
             a_bar_prev = self.alphas[torch.clamp(t - 1, 0)].view(-1, 1, 1, 1)
 
-            # 先用當前 x 與 t（當作 "prev"）估計 eps_pred（使用負的 guidance_scale）
+            # Predict eps with (usually negative) guidance scale for inversion
             eps_pred = self.get_noise_preds(x, t, text_embeddings, guidance_scale)
 
             pred_type = getattr(self.scheduler.config, "prediction_type", "epsilon")
             if pred_type == "epsilon":
                 eps_t = eps_pred
             elif pred_type == "v_prediction":
-                # 將 v 轉成 eps 的等效形式
                 eps_t = a_bar.sqrt() * eps_pred + (1.0 - a_bar).sqrt() * x
             else:
                 eps_t = eps_pred
 
-            # 從 (x_t, eps_t) 反推 x0_pred（標準 DDIM 關係式）
+            # Estimate x0 from current x_t and eps_t (DDIM relation)
             x0_pred = (x - (1.0 - a_bar).sqrt() * eps_t) / (a_bar.sqrt().clamp_min(1e-8))
 
-            # DDIM forward（inversion）一步：x_{t+Δ} = sqrt(a_bar_next)*x0_pred + coeff*eps_t + sigma*z
-            a_bar_next = a_bar  # 我們的 ti 就是下一步的 t
-            # 對應 DDIM 的 sigma 設定
+            # Compute DDIM forward step to a noisier time
+            a_bar_next = a_bar
             sigma_t = eta * torch.sqrt(
                 ((1.0 - a_bar_prev) / (1.0 - a_bar_next).clamp_min(1e-8)) * (1.0 - (a_bar_next / a_bar_prev).clamp_min(1e-8))
             ).clamp_min(0.0)
 
-            # 確保數值穩定
             coeff = torch.sqrt((1.0 - a_bar_next - sigma_t ** 2).clamp_min(0.0))
-
             z = torch.randn_like(x) if eta > 0 else torch.zeros_like(x)
+
             x = a_bar_next.sqrt() * x0_pred + coeff * eps_t + sigma_t * z
 
         return x
         # --------------------------------------------------------------------
+
     
     def get_sdi_loss(
         self, 
@@ -318,14 +346,11 @@ class StableDiffusion(nn.Module):
         
         # TODO: Create current timestep tensor based on training progress
         # t = ...
-
         # --------------------------------------------------------------------
-        # 線性退火：從 max_step → min_step
         prog = float(current_iter) / max(1, int(total_iters))
         t_scalar = int(round(self.max_step - (self.max_step - self.min_step) * prog))
         t = torch.full((B,), t_scalar, device=self.device, dtype=torch.long)
         # --------------------------------------------------------------------
-    
         # Check if we need to update target
         should_update = (current_iter % update_interval == 0) or not hasattr(self, 'sdi_target')
         
@@ -347,7 +372,6 @@ class StableDiffusion(nn.Module):
                 
                 # TODO: Denoise to get target x0 using predicted noise
                 # target = ...
-
                 # ----------------------------------------------------------------
                 a_bar = self.alphas[t].view(-1, 1, 1, 1)
                 pred_type = getattr(self.scheduler.config, "prediction_type", "epsilon")
@@ -358,21 +382,18 @@ class StableDiffusion(nn.Module):
                 else:
                     eps_pred = noise_pred
 
-                # x0 = (x_t - sqrt(1 - a_bar)*eps) / sqrt(a_bar)
                 target = (latents_noisy - (1.0 - a_bar).sqrt() * eps_pred) / (a_bar.sqrt().clamp_min(1e-8))
                 # ----------------------------------------------------------------
-                
                 
                 # Cache the target
                 self.sdi_target = target.detach()
         
         # TODO: Compute MSE loss between current latents and cached target
         # loss = ...
-        
         # --------------------------------------------------------------------
         loss = F.mse_loss(latents, self.sdi_target)
         # --------------------------------------------------------------------
-        
+
         return loss
         
     @torch.no_grad()
